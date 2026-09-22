@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentisend"
+version = "0.1.0"
+description = "AgentiSend — agent-first email API. Official Python SDK."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.urls]
+Documentation = "https://agentisend.com/docs"
+
+[tool.setuptools]
+packages = ["agentisend"]
