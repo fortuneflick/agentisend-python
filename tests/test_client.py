@@ -38,9 +38,11 @@ class FakeApiHandler(BaseHTTPRequestHandler):
         journal.append(record)
 
         status, payload, extra_headers = routes.pop(0) if routes else (200, {"ok": True}, {})
-        body = json.dumps(payload).encode("utf-8")
+        # bytes are sent as they are: a download (.eml, MIME, CSV), not JSON.
+        raw = isinstance(payload, bytes)
+        body = payload if raw else json.dumps(payload).encode("utf-8")
         self.send_response(status)
-        self.send_header("content-type", "application/json")
+        self.send_header("content-type", "text/plain; charset=utf-8" if raw else "application/json")
         self.send_header("x-request-id", "py-test-req-1")
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
@@ -187,6 +189,65 @@ class ClientTest(unittest.TestCase):
         routes.append((200, {"data": [], "has_more": False}, None))
         self.client.list_dead_letters("wh_1", limit=5, cursor=None)
         self.assertEqual(journal[0]["path"], "/webhooks/wh_1/dead-letters?limit=5")
+
+    def test_kill_all_stops_every_key_in_one_post(self) -> None:
+        routes.append((200, {"paused": True, "affected_key_ids": ["k1"], "reason": "loop", "at": "t"}, None))
+        out = self.client.kill_all(reason="loop", idempotency="kill-all/incident-7")
+        self.assertEqual(out["affected_key_ids"], ["k1"])
+        req = journal[0]
+        self.assertEqual((req["method"], req["path"]), ("POST", "/limits/kill-all"))
+        self.assertEqual(req["body"], {"reason": "loop"})
+        self.assertEqual(req["idempotency_key"], "kill-all/incident-7")
+
+    def test_rotation_deliveries_wait_and_events_reach_their_own_paths(self) -> None:
+        self.client.rotate_api_key("k1", grace_hours=24)
+        self.client.rotate_webhook_secret("w1")
+        self.client.list_webhook_deliveries("w1", status="dead_lettered")
+        self.client.wait_for_domain("d1", timeout=20)
+        self.client.list_email_events("m1", limit=5)
+        self.assertEqual(
+            [f"{r['method']} {r['path']}" for r in journal],
+            [
+                "POST /api-keys/k1/rotate",
+                "POST /webhooks/w1/rotate-secret",
+                "GET /webhooks/w1/deliveries?status=dead_lettered",
+                "GET /domains/d1/wait?timeout=20",
+                "GET /emails/m1/events?limit=5",
+            ],
+        )
+        self.assertEqual(journal[0]["body"], {"grace_hours": 24})
+
+    def test_text_downloads_come_back_as_text(self) -> None:
+        # The MIME source and the CSV export are text/plain and text/csv, not
+        # JSON: reading them through the JSON path raised a transport error.
+        routes.append((200, b"Subject: hi\r\n\r\nbody", None))
+        routes.append((200, b"id,created_at,from,to,subject,status", None))
+        routes.append((200, b"Subject: hi\r\n\r\nbody", None))
+        self.assertEqual(self.client.email_mime("m1"), "Subject: hi\r\n\r\nbody")
+        self.assertEqual(self.client.export_emails(), "id,created_at,from,to,subject,status")
+        self.assertEqual(self.client.email_eml("m1"), "Subject: hi\r\n\r\nbody")
+
+    def test_user_agent_carries_the_sdk_version(self) -> None:
+        # DX-14: support has to be able to tell one SDK version from another.
+        import platform
+
+        from agentisend import __version__
+
+        self.client.status()
+        self.assertEqual(
+            journal[0]["user_agent"], f"agentisend-python/{__version__} python/{platform.python_version()}"
+        )
+        AgentiSend(api_key="as_x", base_url=self.base_url, user_agent="my-agent/2").status()
+        self.assertEqual(journal[1]["user_agent"], "my-agent/2")
+
+    def test_version_matches_pyproject(self) -> None:
+        import tomllib
+        from pathlib import Path
+
+        from agentisend import __version__
+
+        pyproject = tomllib.loads(Path(__file__).resolve().parents[1].joinpath("pyproject.toml").read_text())
+        self.assertEqual(__version__, pyproject["project"]["version"])
 
     def test_missing_api_key_raises_immediately(self) -> None:
         saved = dict(__import__("os").environ)

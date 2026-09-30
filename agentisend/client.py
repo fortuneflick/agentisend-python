@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from ._version import __version__
 from .errors import AgentiSendError, AgentiSendTransportError
 from .types import (
     AddressList,
@@ -70,7 +72,7 @@ class AgentiSend:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout_seconds: float = 30.0,
-        user_agent: str = "agentisend-python",
+        user_agent: Optional[str] = None,
     ) -> None:
         key = api_key or os.environ.get("AGENTISEND_API_KEY", "")
         if not key:
@@ -81,7 +83,8 @@ class AgentiSend:
         self.api_key = key
         self.base_url = (base_url or os.environ.get("AGENTISEND_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.timeout_seconds = timeout_seconds
-        self.user_agent = user_agent
+        # DX-14: the version travels, so support can tell one release from another.
+        self.user_agent = user_agent or f"agentisend-python/{__version__} python/{platform.python_version()}"
 
     def request(
         self,
@@ -222,7 +225,8 @@ class AgentiSend:
         """Every API request this account made (M5.9).
 
         Filters: since, until, status, status_class ("2xx"/"4xx"/"5xx"),
-        method, route, error_code, api_key_id — plus limit/cursor/after.
+        method, route, error_code, api_key_id, q, source
+        ("api"/"console"/"all") — plus limit/cursor/after.
         """
         params = _page_query(query)
         for key in (
@@ -234,6 +238,8 @@ class AgentiSend:
             "route",
             "error_code",
             "api_key_id",
+            "q",
+            "source",
         ):
             if query.get(key) is not None:
                 params[key] = query[key]
@@ -248,6 +254,18 @@ class AgentiSend:
     def status(self) -> Dict[str, Any]:
         """Public per-component health: what is operational, degraded or down."""
         return self.request("GET", "/status")
+
+    def status_history(self, days: Optional[int] = None) -> Dict[str, Any]:
+        """Daily uptime per component over the last 90 days, or ``days``."""
+        return self.request("GET", "/status/history", query={"days": days})
+
+    def dns_check(self, domain: str) -> Dict[str, Any]:
+        """Sending-domain DNS check. No API key. Returns the records to publish."""
+        return self.request("GET", f"/tools/dns/{urllib.parse.quote(domain, safe='')}")
+
+    def account(self) -> Dict[str, Any]:
+        """Lifecycle status, the reason for it, and when the account was created."""
+        return self.request("GET", "/account")
 
     # ---- emails -----------------------------------------------------------
 
@@ -277,6 +295,10 @@ class AgentiSend:
     def get_received_email(self, message_id: str) -> Dict[str, Any]:
         """One received email: headers and bodies as data — nothing is rendered."""
         return self.request("GET", f"/emails/receiving/{message_id}")
+
+    def delete_received_email(self, message_id: str) -> Dict[str, Any]:
+        """Delete one received email for good."""
+        return self.request("DELETE", f"/emails/receiving/{message_id}")
 
     def list_received_threads(self, **query: Any) -> Dict[str, Any]:
         """Received mail grouped by Message-ID / In-Reply-To / References."""
@@ -337,6 +359,13 @@ class AgentiSend:
     def delete_api_key(self, key_id: str, idempotency: Optional[str] = None) -> Deleted:
         return self.request("DELETE", f"/api-keys/{key_id}", idempotency=idempotency)
 
+    def rotate_api_key(self, key_id: str, grace_hours: int, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Issue a new token, returned once. The old one keeps working for
+        ``grace_hours`` (0, 1 or 24) so a deploy can pick up the new one."""
+        return self.request(
+            "POST", f"/api-keys/{key_id}/rotate", body={"grace_hours": grace_hours}, idempotency=idempotency
+        )
+
     # ---- domains ----------------------------------------------------------
 
     def create_domain(
@@ -348,7 +377,8 @@ class AgentiSend:
         return_path_subdomain: Optional[str] = None,
         idempotency: Optional[str] = None,
     ) -> Domain:
-        """Region is optional and defaults to us (Oregon). eu is Helsinki.
+        """Region is optional and defaults to us. eu is recorded on the domain;
+        today all mail is sent from our US nodes.
 
         return_path_subdomain is ``send`` (default) or ``bounce`` when send
         already has an MX pointing elsewhere.
@@ -395,6 +425,16 @@ class AgentiSend:
 
     def delete_domain(self, domain_id: str, idempotency: Optional[str] = None) -> Deleted:
         return self.request("DELETE", f"/domains/{domain_id}", idempotency=idempotency)
+
+    def wait_for_domain(self, domain_id: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """Long-poll until the domain is verified or failed, or ``timeout``
+        seconds (0-25) pass; 0 is a snapshot. It does not re-check DNS: the
+        server checks on its own, and ``next_poll_seconds`` says when to ask again."""
+        return self.request("GET", f"/domains/{domain_id}/wait", query={"timeout": timeout})
+
+    def list_domain_events(self, domain_id: str, **page: Any) -> Dict[str, Any]:
+        """Newest-first timeline: each DNS check, each record found or lost, verified, deleted."""
+        return self.request("GET", f"/domains/{domain_id}/events", query=_page_query(page))
 
     # ---- webhooks ---------------------------------------------------------
 
@@ -443,6 +483,15 @@ class AgentiSend:
             query={"limit": limit, "cursor": cursor, "after": after},
         )
 
+    def list_webhook_deliveries(self, webhook_id: str, **query: Any) -> Dict[str, Any]:
+        """Every delivery to this endpoint, with each attempt and what the receiver
+        answered. Filters: id, event_type, status, since, until, limit, cursor, after."""
+        return self.request("GET", f"/webhooks/{webhook_id}/deliveries", query=query)
+
+    def rotate_webhook_secret(self, webhook_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """A new signing secret, returned once. The previous one keeps verifying for 24 hours."""
+        return self.request("POST", f"/webhooks/{webhook_id}/rotate-secret", idempotency=idempotency)
+
     # ---- limits + trust ---------------------------------------------------
 
     def list_limits(self, **page: Any) -> Page[Limit]:
@@ -478,12 +527,31 @@ class AgentiSend:
     def resume_key(self, api_key_id: str, idempotency: Optional[str] = None) -> Limit:
         return self.request("POST", f"/limits/keys/{api_key_id}/resume", idempotency=idempotency)
 
+    def kill_all(self, reason: Optional[str] = None, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Stop every key on the account sending, in one call. Undoing it is a
+        person's decision, made in the console; no key can resume it."""
+        body: Dict[str, Any] = {}
+        if reason is not None:
+            body["reason"] = reason
+        return self.request("POST", "/limits/kill-all", body=body, idempotency=idempotency)
+
     def trust_standing(self) -> TrustStanding:
         return self.request("GET", "/trust/standing")
 
     def trust_thresholds(self) -> Dict[str, Any]:
         """The published enforcement thresholds and the ladder they drive."""
         return self.request("GET", "/trust/thresholds")
+
+    def update_account(
+        self, postal_address: Optional[str], idempotency: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Set the postal address printed in every broadcast footer. None clears it.
+
+        A broadcast is not sent until the account has one.
+        """
+        return self.request(
+            "PATCH", "/account", body={"postal_address": postal_address}, idempotency=idempotency
+        )
 
     def export_account(self) -> bytes:
         """Your emails, suppressions and domains as a zip. Bytes, not JSON."""
@@ -516,6 +584,10 @@ class AgentiSend:
     def cancel_email(self, email_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
         """Cancel a scheduled or queued email. Settled mail is history."""
         return self.request("POST", f"/emails/{email_id}/cancel", idempotency=idempotency)
+
+    def delete_email(self, email_id: str) -> Dict[str, Any]:
+        """Delete a sent email and its events for good. A scheduled one must be cancelled first."""
+        return self.request("DELETE", f"/emails/{email_id}")
 
     def update_email(self, email_id: str, scheduled_at: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
         """Move a scheduled email — the PATCH verb, same act as reschedule (M5.5)."""
@@ -553,37 +625,70 @@ class AgentiSend:
         return self.request_bytes("GET", f"/emails/{email_id}/attachments/{attachment_id}")
 
     def email_mime(self, email_id: str) -> str:
-        """The exact RFC 5322 source of this email."""
-        return self.request("GET", f"/emails/{email_id}/mime")
+        """The exact RFC 5322 source of this email, as text."""
+        return self.request_bytes("GET", f"/emails/{email_id}/mime").decode("utf-8")
+
+    def email_eml(self, email_id: str) -> str:
+        """The same source as a .eml download."""
+        return self.request_bytes("GET", f"/emails/{email_id}/eml").decode("utf-8")
 
     def export_emails(self, query: Optional[Dict[str, Any]] = None) -> str:
         """The message log as CSV."""
-        return self.request("GET", "/emails/export.csv", query=query)
+        return self.request_bytes("GET", "/emails/export.csv", query=query).decode("utf-8")
+
+    def list_email_events(self, email_id: str, **page: Any) -> Dict[str, Any]:
+        """Every event recorded for one message, oldest first."""
+        return self.request("GET", f"/emails/{email_id}/events", query=_page_query(page))
+
+    def email_metrics(self, **query: Any) -> Dict[str, Any]:
+        """Alias of ``metrics``: start_date and end_date name since and until."""
+        return self.request("GET", "/emails/metrics", query=query)
 
     # ---- suppressions ------------------------------------------------------
 
-    def list_suppressions(self, limit: Optional[int] = None, cursor: Optional[str] = None, after: Optional[str] = None) -> Dict[str, Any]:
-        return self.request("GET", "/suppressions", query={"limit": limit, "cursor": cursor, "after": after})
+    def list_suppressions(
+        self,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        after: Optional[str] = None,
+        origin: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self.request(
+            "GET", "/suppressions", query={"limit": limit, "cursor": cursor, "after": after, "origin": origin}
+        )
+
+    def get_suppression(self, suppression_id: str) -> Dict[str, Any]:
+        """One suppression, by its id or by the address."""
+        return self.request("GET", f"/suppressions/{suppression_id}")
 
     def add_suppression(
-        self, email: str, level: Optional[str] = None, idempotency: Optional[str] = None
+        self,
+        email: str,
+        level: Optional[str] = None,
+        origin: Optional[str] = None,
+        idempotency: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Suppress an address, or a whole domain by sending "@example.com"."""
         body: Dict[str, Any] = {"email": email}
         if level is not None:
             body["level"] = level
+        if origin is not None:
+            body["origin"] = origin
         return self.request("POST", "/suppressions", body=body, idempotency=idempotency)
 
     def batch_add_suppressions(
         self,
         emails: List[str],
         level: Optional[str] = None,
+        origin: Optional[str] = None,
         idempotency: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Up to 500 at a time. Each item succeeds or fails on its own (M5.5)."""
         body: Dict[str, Any] = {"emails": emails}
         if level is not None:
             body["level"] = level
+        if origin is not None:
+            body["origin"] = origin
         return self.request("POST", "/suppressions/batch/add", body=body, idempotency=idempotency)
 
     def batch_remove_suppressions(
@@ -624,6 +729,10 @@ class AgentiSend:
     def publish_template(self, template_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
         return self.request("POST", f"/templates/{template_id}/publish", idempotency=idempotency)
 
+    def delete_template(self, template_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Delete a template and its versions. Refused (template_in_use) while an unsent broadcast uses it."""
+        return self.request("DELETE", f"/templates/{template_id}", idempotency=idempotency)
+
     def duplicate_template(
         self, template_id: str, name: Optional[str] = None, idempotency: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -658,10 +767,13 @@ class AgentiSend:
         values: Optional[Dict[str, Any]] = None,
         version_number: Optional[int] = None,
         idempotency: Optional[str] = None,
+        preview: bool = False,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {"values": values or {}}
         if version_number is not None:
             body["version_number"] = version_number
+        if preview:
+            body["preview"] = True
         return self.request("POST", f"/templates/{template_id}/render", body=body, idempotency=idempotency)
 
     # ---- trust ---------------------------------------------------------------
@@ -669,6 +781,16 @@ class AgentiSend:
     def appeal_trust(self, reason: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
         """File an appeal against the current standing. Recorded verbatim."""
         return self.request("POST", "/trust/appeal", body={"reason": reason}, idempotency=idempotency)
+
+    def trust_remediation(self) -> Dict[str, Any]:
+        """The remediation checklist, with what has been ticked."""
+        return self.request("GET", "/trust/remediation")
+
+    def set_trust_remediation(self, key: str, done: bool, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Tick or untick one checklist item. Returns the whole checklist."""
+        return self.request(
+            "POST", "/trust/remediation", body={"key": key, "done": done}, idempotency=idempotency
+        )
 
     # ---- agent actions (B8 approval queue) ---------------------------------
 
@@ -692,6 +814,15 @@ class AgentiSend:
     def deliverability(self, domain_id: str) -> Dict[str, Any]:
         """Per-domain reputation: live rates, daily snapshots, external checks."""
         return self.request("GET", f"/deliverability/domains/{domain_id}")
+
+    def list_deliverability(self, window_days: Optional[int] = None) -> Dict[str, Any]:
+        """Every sending domain with its standing over the window, worst first."""
+        return self.request("GET", "/deliverability/domains", query={"window_days": window_days})
+
+    def dmarc(self, domain: Optional[str] = None, window_days: Optional[int] = None) -> Dict[str, Any]:
+        """Aggregate authentication reports: aligned and failing volume per day,
+        and every address sending as you."""
+        return self.request("GET", "/deliverability/dmarc", query={"domain": domain, "window_days": window_days})
 
     def snapshot_deliverability(self, domain_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
         """Persist today's rates as a snapshot row (idempotent per day)."""
@@ -721,6 +852,96 @@ class AgentiSend:
 
     def get_contact(self, contact_id: str) -> Dict[str, Any]:
         return self.request("GET", f"/contacts/{contact_id}")
+
+    def batch_contacts(self, contacts: list, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Create or update up to 1,000 contacts. Each item succeeds or fails on its own."""
+        return self.request("POST", "/contacts/batch", body={"contacts": contacts}, idempotency=idempotency)
+
+    def import_contacts(
+        self,
+        csv: str,
+        column_map: Optional[Dict[str, str]] = None,
+        on_conflict: Optional[str] = None,
+        idempotency: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Import a CSV. Finishes in this response. on_conflict defaults to skip."""
+        body: Dict[str, Any] = {"csv": csv}
+        if column_map is not None:
+            body["column_map"] = column_map
+        if on_conflict is not None:
+            body["on_conflict"] = on_conflict
+        return self.request("POST", "/contacts/imports", body=body, idempotency=idempotency)
+
+    def list_contact_segments(self, contact_id: str) -> Dict[str, Any]:
+        """Segments whose rules include this contact. The id may be an email."""
+        return self.request("GET", f"/contacts/{contact_id}/segments")
+
+    def add_contact_segment(self, contact_id: str, segment_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Refused. Membership is the segment's rules. The fix names PATCH /segments/:id."""
+        return self.request("POST", f"/contacts/{contact_id}/segments/{segment_id}", idempotency=idempotency)
+
+    def remove_contact_segment(self, contact_id: str, segment_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Refused. Membership is the segment's rules. The fix names PATCH /segments/:id."""
+        return self.request("DELETE", f"/contacts/{contact_id}/segments/{segment_id}", idempotency=idempotency)
+
+    def list_contact_properties(self) -> Dict[str, Any]:
+        """Property names and types already stored on the account."""
+        return self.request("GET", "/contact-properties")
+
+    def get_contact_property(self, property_id: str) -> Dict[str, Any]:
+        return self.request("GET", f"/contact-properties/{property_id}")
+
+    def resubscribe_contact(
+        self, contact_id: str, consent_source: str, consent_at: str, idempotency: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Mark a contact active again after they opt back in."""
+        return self.request(
+            "POST",
+            f"/contacts/{contact_id}/resubscribe",
+            body={"consent_source": consent_source, "consent_at": consent_at},
+            idempotency=idempotency,
+        )
+
+    def create_audience_contact(
+        self, audience_id: str, email: str, properties: Optional[Dict[str, Any]] = None, idempotency: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Alias of POST /contacts. This account has one contact list."""
+        body: Dict[str, Any] = {"email": email}
+        if properties is not None:
+            body["properties"] = properties
+        return self.request("POST", f"/audiences/{audience_id}/contacts", body=body, idempotency=idempotency)
+
+    def list_audience_contacts(
+        self, audience_id: str, limit: Optional[int] = None, cursor: Optional[str] = None, email: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return self.request(
+            "GET", f"/audiences/{audience_id}/contacts", query={"limit": limit, "cursor": cursor, "email": email}
+        )
+
+    def get_audience_contact(self, audience_id: str, contact_id: str) -> Dict[str, Any]:
+        return self.request("GET", f"/audiences/{audience_id}/contacts/{contact_id}")
+
+    def update_audience_contact(
+        self, audience_id: str, contact_id: str, payload: Dict[str, Any], idempotency: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return self.request(
+            "PATCH", f"/audiences/{audience_id}/contacts/{contact_id}", body=payload, idempotency=idempotency
+        )
+
+    def delete_audience_contact(
+        self, audience_id: str, contact_id: str, idempotency: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return self.request(
+            "DELETE", f"/audiences/{audience_id}/contacts/{contact_id}", idempotency=idempotency
+        )
+
+    def list_segment_contacts(
+        self, segment_id: str, limit: Optional[int] = None, cursor: Optional[str] = None, email: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Alias of GET /contacts. This account has one contact list."""
+        return self.request(
+            "GET", f"/segments/{segment_id}/contacts", query={"limit": limit, "cursor": cursor, "email": email}
+        )
 
     def delete_contact(self, contact_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
         return self.request("DELETE", f"/contacts/{contact_id}", idempotency=idempotency)
@@ -872,18 +1093,26 @@ class AgentiSend:
         return self.request("GET", "/broadcasts", query=_page_query(page))
 
     def cancel_broadcast(self, broadcast_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
-        """Cancel a scheduled broadcast: it returns to draft, editable again."""
+        """Cancel a scheduled broadcast, or stop one that is still sending. Mail already handed off is not pulled back. A scheduled broadcast returns to draft."""
         return self.request("POST", f"/broadcasts/{broadcast_id}/cancel", idempotency=idempotency)
 
     def get_broadcast(self, broadcast_id: str) -> Dict[str, Any]:
         return self.request("GET", f"/broadcasts/{broadcast_id}")
+
+    def broadcast_stats(self, broadcast_id: str) -> Dict[str, Any]:
+        """Sent, delivered, opened, clicked, bounced, complained and unsubscribed. A test send is not included."""
+        return self.request("GET", f"/broadcasts/{broadcast_id}/stats")
+
+    def broadcast_preview(self, broadcast_id: str) -> Dict[str, Any]:
+        """The rendered message. Nothing is sent."""
+        return self.request("GET", f"/broadcasts/{broadcast_id}/preview")
 
     def update_broadcast(self, broadcast_id: str, payload: Dict[str, Any], idempotency: Optional[str] = None) -> Dict[str, Any]:
         """Rename anytime; content edits only while draft."""
         return self.request("PATCH", f"/broadcasts/{broadcast_id}", body=payload, idempotency=idempotency)
 
     def send_broadcast(self, broadcast_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
-        """Send now; content snapshots and becomes immutable."""
+        """Send now. Returns 200 when the broadcast has finished, and 202 while it is still sending. A 202 has status sending."""
         return self.request("POST", f"/broadcasts/{broadcast_id}/send", idempotency=idempotency)
 
     def archive_broadcast(self, broadcast_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
@@ -967,6 +1196,7 @@ class AgentiSend:
         return self.request("GET", "/dedicated-ips", query=_page_query(page))
 
     def provision_dedicated_ip(self, ip: str, region: str, idempotency: Optional[str] = None) -> Dict[str, Any]:
+        """Refused (dedicated_ip_assigned_by_us): a dedicated IP is assigned by us; ask support. list_dedicated_ips shows it once assigned."""
         return self.request("POST", "/dedicated-ips", body={"ip": ip, "region": region}, idempotency=idempotency)
 
     def release_dedicated_ip(self, ip_id: str, idempotency: Optional[str] = None) -> Dict[str, Any]:

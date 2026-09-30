@@ -5,14 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentisend"
 version = "0.1.0"
-description = "AgentiSend — agent-first email API. Official Python SDK."
+description = "AgentiSend is a transactional email API for AI agents. A send budget on every key, a preflight that sends nothing, refusals that name the fix, one call that stops every sender."
+authors = [{ name = "AgentiSend", email = "hello@agentisend.com" }]
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = []
+keywords = ["email", "email-api", "transactional-email", "ai-agents", "agents", "mcp", "webhooks", "resend-alternative"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Communications :: Email",
+]
 
 [project.urls]
+Homepage = "https://agentisend.com"
 Documentation = "https://agentisend.com/docs"
+Source = "https://github.com/fortuneflick/agentisend-python"
+Issues = "https://github.com/fortuneflick/agentisend-python/issues"
 
 [tool.setuptools]
 packages = ["agentisend"]
